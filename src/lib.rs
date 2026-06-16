@@ -9,8 +9,6 @@
 //! `host:port` tuples is fully governed by the host policy.
 
 use act_sdk::prelude::*;
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::net::TcpStream;
 
 mod keysyms;
@@ -23,34 +21,19 @@ mod component {
     use super::*;
     use serde::Serialize;
 
-    // The component is single-threaded inside the wasm runtime, so
-    // RefCell suffices. A `Mutex` would also work but adds binary size.
+    // Session state lives in the SDK's SessionRegistry — a per-component
+    // session-id -> T map (the wasm runtime is single-threaded).
     thread_local! {
-        static SESSIONS: RefCell<HashMap<String, RefCell<Connection>>> =
-            RefCell::new(HashMap::new());
-        static NEXT_ID: RefCell<u64> = const { RefCell::new(0) };
-    }
-
-    fn alloc_id() -> String {
-        NEXT_ID.with(|n| {
-            let mut g = n.borrow_mut();
-            *g += 1;
-            format!("vnc_{}", *g)
-        })
+        static SESSIONS: SessionRegistry<Connection> = SessionRegistry::new("vnc");
     }
 
     fn with_session<F, T>(id: &str, f: F) -> ActResult<T>
     where
         F: FnOnce(&mut Connection) -> ActResult<T>,
     {
-        SESSIONS.with(|reg| {
-            let reg = reg.borrow();
-            let cell = reg
-                .get(id)
-                .ok_or_else(|| ActError::session_not_found(format!("Unknown session-id: {id}")))?;
-            let mut conn = cell.borrow_mut();
-            f(&mut conn)
-        })
+        SESSIONS
+            .with(|r| r.with_mut(id, f))
+            .ok_or_else(|| ActError::session_not_found(format!("Unknown session-id: {id}")))?
     }
 
     // ── Session args ────────────────────────────────────────────────────
@@ -83,15 +66,13 @@ mod component {
         let stream = TcpStream::connect(&addr)
             .map_err(|e| ActError::internal(format!("VNC connect failed ({addr}): {e}")))?;
         let conn = Connection::handshake(stream, args.password.as_deref(), args.shared)?;
-        let id = alloc_id();
-        SESSIONS.with(|r| r.borrow_mut().insert(id.clone(), RefCell::new(conn)));
-        Ok(id)
+        Ok(SESSIONS.with(|r| r.insert(conn)))
     }
 
     #[session_close]
     fn close(session_id: String) {
         SESSIONS.with(|r| {
-            r.borrow_mut().remove(&session_id);
+            r.remove(&session_id);
         });
     }
 
