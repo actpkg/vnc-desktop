@@ -4,15 +4,17 @@ component_ref := env("OCI_REF", "actpkg.dev/library/vnc-desktop")
 
 act := env("ACT", "npx @actcore/act")
 actbuild := env("ACT_BUILD", "npx @actcore/act-build")
-hurl := env("HURL", "npx @orangeopensource/hurl")
+hurl := env("HURL", "hurl")
 # Random port for the e2e server, in a safe range: above the well-known/common
 # dev ports and below the Linux outbound ephemeral range (32768+).
 port := `shuf -i 10000-29999 -n 1`
 addr := "[::1]:" + port
 baseurl := "http://" + addr
 
+# Fetch WIT deps from the registry (ghcr.io/actcore) into wit/deps/.
+# wkg-registry.toml maps the act namespace -> actcore.dev (well-known -> ghcr.io/actcore).
 init:
-    wit-deps
+    WKG_CONFIG_FILE=wkg-registry.toml wkg wit fetch --type wit
 
 setup: init
     prek install
@@ -30,9 +32,10 @@ test: pack
     # CI sets VNC_HOST + VNC_PORT after launching Xvfb + x11vnc
     VNC_HOST="${VNC_HOST:-127.0.0.1}"
     VNC_PORT="${VNC_PORT:-5900}"
-    {{act}} run --http --listen "{{addr}}" --sockets-allow "$VNC_HOST:$VNC_PORT" {{wasm}} &
+    GRANT="{\"wasi:sockets\":{\"mode\":\"allowlist\",\"allow\":[{\"host\":\"$VNC_HOST\",\"ports\":[$VNC_PORT],\"protocols\":[\"tcp\"]}]}}"
+    {{act}} run --http --listen "{{addr}}" --grant "$GRANT" {{wasm}} &
     trap "kill $!" EXIT
-    npx wait-on -t 180s {{baseurl}}/info
+    curl --retry 60 --retry-connrefused --retry-delay 1 -fsS -o /dev/null {{baseurl}}/info
     {{hurl}} --test \
       --variable "baseurl={{baseurl}}" \
       --variable "vnc_host=$VNC_HOST" \
@@ -42,13 +45,11 @@ test: pack
 publish: pack
     #!/usr/bin/env bash
     set -euo pipefail
-    INFO=$({{act}} info {{wasm}} --format json)
-    VERSION=$(echo "$INFO" | jq -r .version)
-    SOURCE=$(git remote get-url origin 2>/dev/null | sed 's/\.git$//' | sed 's|git@github.com:|https://github.com/|' || echo "")
+    INFO=$({{act}} inspect component-manifest {{wasm}})
+    VERSION=$(echo "$INFO" | jq -r .std.version)
     OUTPUT=$({{actbuild}} push {{wasm}} "{{component_ref}}:$VERSION" \
       --skip-if-exists \
-      --also-tag latest \
-      --source "$SOURCE" 2>&1) || { echo "$OUTPUT" >&2; exit 1; }
+      --also-tag latest 2>&1) || { echo "$OUTPUT" >&2; exit 1; }
     echo "$OUTPUT"
     DIGEST=$(echo "$OUTPUT" | grep "^Digest:" | awk '{print $2}' || true)
     if [ -n "${GITHUB_OUTPUT:-}" ]; then

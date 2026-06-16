@@ -110,11 +110,7 @@ impl Connection {
     /// Open the TCP stream, run the RFB 3.8 handshake, request a fixed
     /// pixel format, advertise the encodings we support, and seed the
     /// local framebuffer with one full update.
-    pub fn handshake(
-        stream: TcpStream,
-        password: Option<&str>,
-        shared: bool,
-    ) -> ActResult<Self> {
+    pub fn handshake(stream: TcpStream, password: Option<&str>, shared: bool) -> ActResult<Self> {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
 
@@ -268,7 +264,8 @@ impl Connection {
         let mut pf = [0u8; 16];
         pf.copy_from_slice(&header[4..20]);
         self.pixel_format = PixelFormat::decode(&pf);
-        let name_len = u32::from_be_bytes([header[20], header[21], header[22], header[23]]) as usize;
+        let name_len =
+            u32::from_be_bytes([header[20], header[21], header[22], header[23]]) as usize;
         let mut name = vec![0u8; name_len];
         self.stream
             .read_exact(&mut name)

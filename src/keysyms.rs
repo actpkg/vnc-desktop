@@ -45,9 +45,9 @@ pub fn lookup(name: &str) -> Option<u32> {
     }
     Some(match n.as_str() {
         // Modifiers — left variants by convention.
-        "ctrl" | "control" => 0xffe3,    // Control_L
-        "shift" => 0xffe1,                // Shift_L
-        "alt" => 0xffe9,                  // Alt_L
+        "ctrl" | "control" => 0xffe3,               // Control_L
+        "shift" => 0xffe1,                          // Shift_L
+        "alt" => 0xffe9,                            // Alt_L
         "meta" | "super" | "win" | "cmd" => 0xffeb, // Super_L
 
         // Whitespace + editing.

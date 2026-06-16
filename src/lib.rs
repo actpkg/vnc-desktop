@@ -80,9 +80,8 @@ mod component {
     #[session_open]
     fn open(args: OpenArgs) -> ActResult<String> {
         let addr = format!("{}:{}", args.host, args.port);
-        let stream = TcpStream::connect(&addr).map_err(|e| {
-            ActError::internal(format!("VNC connect failed ({addr}): {e}"))
-        })?;
+        let stream = TcpStream::connect(&addr)
+            .map_err(|e| ActError::internal(format!("VNC connect failed ({addr}): {e}")))?;
         let conn = Connection::handshake(stream, args.password.as_deref(), args.shared)?;
         let id = alloc_id();
         SESSIONS.with(|r| r.borrow_mut().insert(id.clone(), RefCell::new(conn)));
@@ -258,10 +257,7 @@ mod component {
     }
 
     #[act_tool(description = "Release a single key previously pressed with `key_down`.")]
-    fn key_up(
-        key: String,
-        ctx: &mut ActContext<ToolMeta>,
-    ) -> ActResult<()> {
+    fn key_up(key: String, ctx: &mut ActContext<ToolMeta>) -> ActResult<()> {
         let id = ctx.metadata().session_id.clone();
         let k = keysyms::lookup(&key)
             .ok_or_else(|| ActError::invalid_args(format!("Unknown key: {key}")))?;
@@ -274,9 +270,7 @@ mod component {
         description = "Capture the current framebuffer as a PNG. Returns an `image/png` content-part.",
         read_only
     )]
-    fn screenshot(
-        ctx: &mut ActContext<ToolMeta>,
-    ) -> ActResult<Content> {
+    fn screenshot(ctx: &mut ActContext<ToolMeta>) -> ActResult<Content> {
         let id = ctx.metadata().session_id.clone();
         let png = with_session(&id, |c| c.capture_png())?;
         Ok(Content("image/png", png))
@@ -286,9 +280,7 @@ mod component {
         description = "Return the remote desktop's resolution and pixel format.",
         read_only
     )]
-    fn display_info(
-        ctx: &mut ActContext<ToolMeta>,
-    ) -> ActResult<DisplayInfo> {
+    fn display_info(ctx: &mut ActContext<ToolMeta>) -> ActResult<DisplayInfo> {
         let id = ctx.metadata().session_id.clone();
         with_session(&id, |c| {
             Ok(DisplayInfo {
@@ -335,9 +327,7 @@ mod component {
                        Returns the last `ServerCutText` payload, or an empty string if none has \
                        been seen since the session opened."
     )]
-    fn copy(
-        ctx: &mut ActContext<ToolMeta>,
-    ) -> ActResult<String> {
+    fn copy(ctx: &mut ActContext<ToolMeta>) -> ActResult<String> {
         let id = ctx.metadata().session_id.clone();
         with_session(&id, |c| Ok(c.last_clipboard.clone()))
     }
@@ -393,4 +383,3 @@ mod component {
         pub name: String,
     }
 }
-
