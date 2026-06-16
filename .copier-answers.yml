@@ -1,0 +1,7 @@
+_commit: 0.8.0
+_src_path: https://github.com/actcore/act-template-rust
+component_ref: actpkg.dev/library/vnc-desktop
+description: Sandboxed desktop control over the VNC/RFB protocol
+needs_filesystem: false
+needs_http: false
+project_name: vnc-desktop
