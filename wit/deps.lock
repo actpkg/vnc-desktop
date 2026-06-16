@@ -1,0 +1,17 @@
+[act-core]
+url = "https://github.com/actcore/act-spec/archive/main.tar.gz"
+prefix = "act-spec-main/wit/act-core"
+sha256 = "cab53c14b838631d39742fa82f95c537cfa0c93eee06699bbf90da17b1ccd9d8"
+sha512 = "50ee6423e3d044440c82c3eb94f65b3beb153bdc6bf732c157f4bf4c298763e093ad64614be5b927130c124c282d4a358a21e9110ea478b819da820dc21101ba"
+
+[act-sessions]
+url = "https://github.com/actcore/act-spec/archive/main.tar.gz"
+prefix = "act-spec-main/wit/act-sessions"
+sha256 = "b4ba3f292eb70aabbf8f0d8d742172013093d4e50220ff4e4d673cd2bbbc4fbd"
+sha512 = "1d137be1aabd2143e0ef00c6a12209cd174d1b7874b1c663bc2e170f4502eca18c54d4bb72619baa2e770786d6b0b9f761c3501d1a0313c7ab9181f329a56ac8"
+
+[act-tools]
+url = "https://github.com/actcore/act-spec/archive/main.tar.gz"
+prefix = "act-spec-main/wit/act-tools"
+sha256 = "c94b4f5a53ccccd00634e7087b0736677e3b23740c3961fe036f74bfe1f8676d"
+sha512 = "9c3cb4fc32c68fe34ac67d7aa8045abf09216173826b2c1fb836259961400f7a9b656f7aa819a90d7dcd28299daae0d8f0b494b7df1cb70c28f6c30f8b82f521"

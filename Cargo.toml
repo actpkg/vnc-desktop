@@ -1,0 +1,26 @@
+[package]
+name = "component-vnc-desktop"
+version = "0.1.0"
+description = "Sandboxed desktop control over the VNC/RFB protocol"
+keywords = ["act", "vnc", "rfb", "desktop", "wasm"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/actpkg/vnc-desktop"
+edition = "2024"
+
+[dependencies]
+act-sdk = "0.9"
+wit-bindgen = { version = "0.58", features = ["async-spawn"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+png = { version = "0.17", default-features = false }
+des = "0.8"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = "z"
+
+[lib]
+crate-type = ["cdylib"]

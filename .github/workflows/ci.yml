@@ -1,0 +1,115 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-wasip2
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,wit-deps-cli,wasm-tools
+
+      - name: Install Node (for npx @actcore/*)
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: wit-deps
+        run: just init
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: just clippy
+
+      - name: cargo test (host)
+        run: cargo test --target x86_64-unknown-linux-gnu --release
+
+      - name: cargo build (wasm)
+        run: just build
+
+      - name: act-build pack
+        run: just pack
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: component
+          path: target/wasm32-wasip2/release/component_vnc_desktop.wasm
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: component
+          path: target/wasm32-wasip2/release/
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Install Xvfb + x11vnc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb x11vnc xdotool
+
+      - name: Launch Xvfb + x11vnc on :99
+        run: |
+          Xvfb :99 -screen 0 1024x768x24 -nolisten tcp &
+          export DISPLAY=:99
+          # Give Xvfb a moment to come up. (Cheap; X has no readiness probe.)
+          for _ in $(seq 1 20); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.5; done
+          x11vnc -display :99 -nopw -localhost -listen 127.0.0.1 -forever -shared -bg
+          # Wait for x11vnc to accept TCP.
+          for _ in $(seq 1 20); do
+            (echo > /dev/tcp/127.0.0.1/5900) >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+        shell: bash
+
+      - name: e2e (hurl)
+        env:
+          VNC_HOST: 127.0.0.1
+          VNC_PORT: '5900'
+        run: just test
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [build, e2e]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: component
+          path: target/wasm32-wasip2/release/
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: oras login
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | npx @actcore/act-build login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: publish
+        run: just publish
