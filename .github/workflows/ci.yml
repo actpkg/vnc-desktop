@@ -18,7 +18,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Node (for npx @actcore/*)
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v6
         with:
           node-version: '22'
 
@@ -55,7 +55,7 @@ jobs:
         with:
           name: component
           path: target/wasm32-wasip2/release/
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: '22'
       - uses: moonrepo/setup-rust@v1
@@ -103,7 +103,7 @@ jobs:
         with:
           name: component
           path: target/wasm32-wasip2/release/
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: '22'
       - uses: moonrepo/setup-rust@v1
