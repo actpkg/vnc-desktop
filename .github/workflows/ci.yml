@@ -60,7 +60,7 @@ jobs:
           node-version: '22'
       - uses: moonrepo/setup-rust@v1
         with:
-          bins: just, wkg
+          bins: just, wkg, hurl
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: just init
