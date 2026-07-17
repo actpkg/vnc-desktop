@@ -18,8 +18,7 @@ Content-Type: application/json
 {
   "arguments": {
     "host": "{{vnc_host}}",
-    "port": {{vnc_port}},
-    "password": "{{vnc_password}}"
+    "port": {{vnc_port}}
   }
 }
 HTTP 201
