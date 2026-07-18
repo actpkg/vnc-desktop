@@ -1,6 +1,6 @@
 [package]
 name = "component-vnc-desktop"
-version = "0.1.1"
+version = "0.1.2"
 description = "Sandboxed desktop control over the VNC/RFB protocol"
 keywords = ["act", "vnc", "rfb", "desktop", "wasm"]
 license = "MIT OR Apache-2.0"
