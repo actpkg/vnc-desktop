@@ -4,12 +4,6 @@ component_ref := env("OCI_REF", "actpkg.dev/library/vnc-desktop")
 
 act := env("ACT", "npx @actcore/act")
 actbuild := env("ACT_BUILD", "npx @actcore/act-build")
-hurl := env("HURL", "hurl")
-# Random port for the e2e server, in a safe range: above the well-known/common
-# dev ports and below the Linux outbound ephemeral range (32768+).
-port := `shuf -i 10000-29999 -n 1`
-addr := "[::1]:" + port
-baseurl := "http://" + addr
 
 # Fetch WIT deps from the registry (ghcr.io/actcore) into wit/deps/.
 # wkg-registry.toml maps the act namespace -> actcore.dev (well-known -> ghcr.io/actcore).
@@ -33,20 +27,7 @@ pack:
     {{actbuild}} pack {{wasm}}
 
 test: build
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # CI sets VNC_HOST + VNC_PORT after launching Xvfb + x11vnc
-    VNC_HOST="${VNC_HOST:-127.0.0.1}"
-    VNC_PORT="${VNC_PORT:-5900}"
-    GRANT="{\"wasi:sockets\":{\"mode\":\"allowlist\",\"allow\":[{\"host\":\"$VNC_HOST\",\"ports\":[$VNC_PORT],\"protocols\":[\"tcp\"]}]}}"
-    {{act}} run --http --listen "{{addr}}" --grant "$GRANT" {{wasm}} &
-    trap "kill $!" EXIT
-    curl --retry 60 --retry-connrefused --retry-delay 1 -fsS -o /dev/null {{baseurl}}/info
-    {{hurl}} --test \
-      --variable "baseurl={{baseurl}}" \
-      --variable "vnc_host=$VNC_HOST" \
-      --variable "vnc_port=$VNC_PORT" \
-      e2e/*.hurl
+    ACT="{{act}}" uv run --project e2e pytest e2e/ -v
 
 publish: build
     #!/usr/bin/env bash
