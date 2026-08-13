@@ -26,8 +26,12 @@ build:
 pack:
     {{actbuild}} pack {{wasm}}
 
+# Rust e2e harness (rmcp client) — replaced the python fastmcp/pytest suite.
+# Must run from inside e2e/: cargo discovers .cargo/config.toml from the CWD,
+# and only e2e/'s own config pins the host target (the component root's pins
+# wasm32-wasip2). Needs Xvfb + x11vnc on PATH (or VNC_HOST/VNC_PORT set).
 test: build
-    ACT="{{act}}" uv run --project e2e pytest e2e/ -v
+    cd e2e && ACT="{{act}}" WASM="../{{wasm}}" cargo test
 
 publish: build
     #!/usr/bin/env bash

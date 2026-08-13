@@ -1,0 +1,10 @@
+# This crate is host-only test code. The component root's .cargo/config.toml
+# defaults every build in this tree to wasm32-wasip2, so pin the host target
+# here — a nearer config file wins — and a bare `cargo test` in e2e/ does the
+# right thing.
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+# One shared build-dir machine-wide (~/.cargo/config.toml redirects it) would
+# collide same-name crates; pin this crate to its own target/.
+build-dir = "target"
