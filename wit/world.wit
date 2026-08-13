@@ -1,6 +1,11 @@
 package component:impl;
 
 world component-world {
+  // Host-provided. Opt-in and declared in act.toml as a bare
+  // `[std.capabilities."act:credentials"]` table; without that declaration
+  // every get-secret is denied outright and no grant can widen it.
+  import act:credentials/store@0.1.0;
+
   export act:tools/tool-provider@0.2.0;
   export act:sessions/session-provider@0.2.0;
 }

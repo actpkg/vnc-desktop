@@ -2,8 +2,30 @@
 name = "vnc-desktop"
 
 [std.capabilities."wasi:sockets"]
+description = """
+One TCP connection per session to a VNC/RFB server. The port range below is \
+the artifact's ceiling; deployments pin the host with --grant."""
 
 [[std.capabilities."wasi:sockets".allow]]
 host = "*"
 ports = [5900, 5901, 5902, 5903, 5904, 5905, 5906, 5907, 5908, 5909]
 protocols = ["tcp"]
+
+# Bare table: the class takes no parameters. An undeclared class is always
+# denied and no grant can widen it, so without this the component cannot reach
+# the credential store however it is run — and a password-protected VNC server
+# becomes unreachable.
+[std.capabilities."act:credentials"]
+
+# Declared so `act login <ref>` prompts for the password with zero arguments.
+# The field name lives in this component's own namespace: `std:` field keys are
+# refused at pack time, and ACT-CONSTANTS §8 registers field *types*, not names.
+[[std.credentials]]
+# `default` is `default_credential_key()` in src/lib.rs — the key a session uses
+# when its args do not name one.
+key = "default"
+description = "VNC authentication password (RFC 6143 §7.2.2)"
+
+[[std.credentials.fields]]
+key = "vnc:password"
+label = "VNC password"

@@ -6,6 +6,24 @@
 //! `ServerCutText`. No CopyRect, no RRE, no Hextile, no TightVNC. Servers
 //! that honour `SetEncodings(Raw=0)` work; everyone else is out of scope
 //! for the MVP.
+//!
+//! # Why the handshake is split in two
+//!
+//! RFB decides *what* to authenticate with in the middle of the handshake:
+//! the server sends the security types it offers, and the client answers with
+//! the one byte it picked. Whether a password is needed at all is therefore
+//! not knowable until the connection is already open, and the password itself
+//! comes from the host credential store — an async call that cannot be made
+//! from inside `open-session` (ACT-AUTH §1.1.4).
+//!
+//! The handshake is not resumable and it is not restartable either: once the
+//! security type is written the server expects the challenge response on the
+//! same TCP stream, so "connect at open, authenticate later" is not an option.
+//! [`Connection::begin`] therefore runs everything up to and including the
+//! security-type list and stops, handing back a [`Pending`]. The caller looks
+//! at [`Pending::offers_vnc_auth`], fetches a credential only if the server
+//! actually asks for one, and calls [`Pending::finish`] to complete the
+//! handshake on the same stream.
 
 use act_sdk::{ActError, ActResult};
 use std::io::{Read, Write};
@@ -13,6 +31,11 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 const PROTOCOL_3_8: &[u8] = b"RFB 003.008\n";
+
+/// Security type 1: the server accepts unauthenticated clients (RFC 6143 §7.2.1).
+const SEC_NONE: u8 = 1;
+/// Security type 2: the legacy DES challenge (RFC 6143 §7.2.2).
+const SEC_VNC_AUTH: u8 = 2;
 
 // Client-to-server message types.
 const C2S_SET_PIXEL_FORMAT: u8 = 0;
@@ -106,26 +129,156 @@ pub struct Connection {
     framebuffer: Vec<u8>,
 }
 
-impl Connection {
-    /// Open the TCP stream, run the RFB 3.8 handshake, request a fixed
-    /// pixel format, advertise the encodings we support, and seed the
-    /// local framebuffer with one full update.
-    pub fn handshake(stream: TcpStream, password: Option<&str>, shared: bool) -> ActResult<Self> {
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+/// Which security type the client will answer the server with.
+///
+/// Returned by [`plan_security`], the one place the choice is made. It is a
+/// pure function of the offered list and whether a password is in hand, which
+/// is what lets the whole policy — including the "no credential needed against
+/// an unauthenticated server" path — be driven on the host target, where no
+/// VNC server and no credential store exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityPlan {
+    /// Security type 1. Nothing is sent that a credential could protect.
+    NoAuth,
+    /// Security type 2, the DES challenge. Needs the password.
+    VncAuth,
+    /// The server offers the password challenge and nothing else, and no
+    /// password is available. The caller turns this into the
+    /// `std:credential-required` refusal — the message naming the
+    /// provisioning command belongs one layer up, with the field names.
+    CredentialRequired,
+}
 
-        let mut conn = Connection {
-            stream,
-            width: 0,
-            height: 0,
-            pixel_format: PixelFormat::requested(),
-            name: String::new(),
-            last_clipboard: String::new(),
-            framebuffer: Vec::new(),
+/// Pick the security type, given what the server offered and whether a
+/// password is in hand.
+///
+/// The order of the arms is the policy, and each one is deliberate:
+///
+/// 1. **A password plus a server that offers `VncAuth` authenticates.** This
+///    is what the pre-credential-store version did when `password` was set in
+///    session args, and it is kept: a server that offers both types and an
+///    operator who provisioned a credential means the credential gets used.
+/// 2. **Otherwise `None`, when offered.** A server offering security type 1
+///    has stated that it accepts unauthenticated clients, so a deployment with
+///    no stored credential works — which is the whole point of consulting the
+///    store lazily and only when asked.
+/// 3. **`VncAuth` with no password is [`SecurityPlan::CredentialRequired`].**
+///    A missing credential is an error only here, where the server genuinely
+///    demands one.
+///
+/// Anything else — a server offering only types this client cannot speak
+/// (TLS-VNC, RA2, Tight's sub-negotiation) — is an error, because there is
+/// nothing to answer with.
+pub fn plan_security(offered: &[u8], have_password: bool) -> ActResult<SecurityPlan> {
+    let none = offered.contains(&SEC_NONE);
+    let vnc = offered.contains(&SEC_VNC_AUTH);
+    match (have_password, none, vnc) {
+        (true, _, true) => Ok(SecurityPlan::VncAuth),
+        (_, true, _) => Ok(SecurityPlan::NoAuth),
+        (false, false, true) => Ok(SecurityPlan::CredentialRequired),
+        (_, false, false) => Err(ActError::internal(format!(
+            "Server offers neither None nor VNC Auth (types {offered:?}); TLS-VNC, \
+             RA2 and Tight sub-negotiation are out of scope for this component"
+        ))),
+    }
+}
+
+/// A connection that has completed the RFB version handshake and read the
+/// server's security-type list, but has chosen nothing yet.
+///
+/// The stream is live and the server is waiting for one byte. Dropping a
+/// `Pending` closes it, which is what a failed credential fetch does — there
+/// is no half-authenticated state to clean up.
+pub struct Pending {
+    conn: Connection,
+    offered: Vec<u8>,
+}
+
+impl Pending {
+    /// The raw security-type list the server sent. For [`plan_security`] and
+    /// for diagnostics; it is not credential material.
+    pub fn offered(&self) -> &[u8] {
+        &self.offered
+    }
+
+    /// Whether the server offers the legacy VNC password challenge. **This is
+    /// the only thing that makes the component ask the credential store**: a
+    /// server that never offers security type 2 never causes a `get-secret`,
+    /// and therefore never causes a consent prompt.
+    pub fn offers_vnc_auth(&self) -> bool {
+        self.offered.contains(&SEC_VNC_AUTH)
+    }
+
+    /// Whether the server accepts unauthenticated clients. The caller uses
+    /// this to decide whether a missing credential is fatal.
+    pub fn offers_none(&self) -> bool {
+        self.offered.contains(&SEC_NONE)
+    }
+
+    /// Finish the handshake on the same stream: answer with `plan`, run the
+    /// challenge if there is one, then `ClientInit` / `ServerInit`, fix the
+    /// pixel format, advertise the encodings, and seed the framebuffer with
+    /// one full update.
+    ///
+    /// A `SecurityResult` failure after [`SecurityPlan::VncAuth`] is reported
+    /// as `std:capability-denied` — the caller keys the session's poison flag
+    /// off that kind, so a rejected password is not re-fetched on every
+    /// subsequent tool call. Every other failure here stays `std:internal` and
+    /// stays retryable, because transport failures fix themselves and
+    /// authentication failures do not.
+    pub fn finish(
+        mut self,
+        plan: SecurityPlan,
+        password: Option<&str>,
+        shared: bool,
+    ) -> ActResult<Connection> {
+        let chosen = match plan {
+            SecurityPlan::NoAuth => SEC_NONE,
+            SecurityPlan::VncAuth => SEC_VNC_AUTH,
+            // Unreachable through `ensure_connection`, which turns this into
+            // the `std:credential-required` refusal before it gets here.
+            SecurityPlan::CredentialRequired => {
+                return Err(ActError::internal(
+                    "internal: finish() called with an unresolved credential requirement",
+                ));
+            }
         };
+        let conn = &mut self.conn;
+        conn.stream
+            .write_all(&[chosen])
+            .map_err(|e| ActError::internal(format!("Write security choice: {e}")))?;
 
-        conn.protocol_handshake()?;
-        conn.security_handshake(password)?;
+        if chosen == SEC_VNC_AUTH {
+            // `unwrap_or("")` is not a fallback: `plan_security` returns
+            // `VncAuth` only when `have_password` was true, and the caller
+            // passes the same password it computed that from.
+            conn.vnc_auth(password.unwrap_or(""))?;
+        }
+
+        // SecurityResult.
+        let mut result = [0u8; 4];
+        conn.stream
+            .read_exact(&mut result)
+            .map_err(|e| ActError::internal(format!("Read SecurityResult: {e}")))?;
+        if u32::from_be_bytes(result) != 0 {
+            let reason = conn.read_reason().unwrap_or_else(|_| "(no reason)".into());
+            return Err(if chosen == SEC_VNC_AUTH {
+                // The one error kind the caller poisons the session on. The
+                // reason is the server's own text; the password is never in it
+                // and is never added to it.
+                ActError::capability_denied(format!(
+                    "The VNC server rejected the stored password: {reason}. Replace it with \
+                     `act secret set <component-ref> --key <credential_key> \
+                     --field vnc:password --fields-stdin`, then open a new session."
+                ))
+            } else {
+                ActError::internal(format!(
+                    "Server refused the unauthenticated connection: {reason}"
+                ))
+            });
+        }
+
+        let mut conn = self.conn;
         conn.client_init(shared)?;
         conn.server_init()?;
 
@@ -141,6 +294,30 @@ impl Connection {
         conn.pump_one_update()?;
 
         Ok(conn)
+    }
+}
+
+impl Connection {
+    /// Phase one: take the TCP stream, agree on RFB 3.8, and read the security
+    /// types the server offers. **Contacts no credential store and sends no
+    /// password** — see the module docs for why the split exists.
+    pub fn begin(stream: TcpStream) -> ActResult<Pending> {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+
+        let mut conn = Connection {
+            stream,
+            width: 0,
+            height: 0,
+            pixel_format: PixelFormat::requested(),
+            name: String::new(),
+            last_clipboard: String::new(),
+            framebuffer: Vec::new(),
+        };
+
+        conn.protocol_handshake()?;
+        let offered = conn.read_security_types()?;
+        Ok(Pending { conn, offered })
     }
 
     // ── handshake phases ───────────────────────────────────────────────
@@ -162,13 +339,17 @@ impl Connection {
         Ok(())
     }
 
-    fn security_handshake(&mut self, password: Option<&str>) -> ActResult<()> {
+    /// Read the server's security-type list. Stops there: nothing is written
+    /// back, so the caller still has a free choice when it returns.
+    fn read_security_types(&mut self) -> ActResult<Vec<u8>> {
         let mut count = [0u8; 1];
         self.stream
             .read_exact(&mut count)
             .map_err(|e| ActError::internal(format!("Read security count: {e}")))?;
         if count[0] == 0 {
-            // Length-prefixed reason follows.
+            // Length-prefixed reason follows. A refusal before any security
+            // type is offered — the server is full, or the client is not
+            // allowed to connect at all — never a credential problem.
             let reason = self.read_reason()?;
             return Err(ActError::internal(format!(
                 "Server rejected connection: {reason}"
@@ -178,47 +359,7 @@ impl Connection {
         self.stream
             .read_exact(&mut types)
             .map_err(|e| ActError::internal(format!("Read security types: {e}")))?;
-
-        // Prefer None when offered AND password absent; otherwise pick
-        // VNC Auth.
-        let none_available = types.contains(&1);
-        let vnc_available = types.contains(&2);
-
-        let chosen = match (password, none_available, vnc_available) {
-            (None, true, _) => 1u8,
-            (_, _, true) => 2u8,
-            (None, false, false) => {
-                return Err(ActError::internal(
-                    "Server offers neither None nor VNC Auth and no fallback is supported",
-                ));
-            }
-            (Some(_), false, false) => {
-                return Err(ActError::internal(
-                    "Server offers neither None nor VNC Auth and no fallback is supported",
-                ));
-            }
-            (Some(_), true, false) => 1u8, // password supplied but server only offers None
-        };
-        self.stream
-            .write_all(&[chosen])
-            .map_err(|e| ActError::internal(format!("Write security choice: {e}")))?;
-
-        if chosen == 2 {
-            self.vnc_auth(password.unwrap_or(""))?;
-        }
-
-        // SecurityResult.
-        let mut result = [0u8; 4];
-        self.stream
-            .read_exact(&mut result)
-            .map_err(|e| ActError::internal(format!("Read SecurityResult: {e}")))?;
-        if u32::from_be_bytes(result) != 0 {
-            let reason = self.read_reason().unwrap_or_else(|_| "(no reason)".into());
-            return Err(ActError::internal(format!(
-                "VNC authentication failed: {reason}"
-            )));
-        }
-        Ok(())
+        Ok(types)
     }
 
     fn vnc_auth(&mut self, password: &str) -> ActResult<()> {
@@ -519,7 +660,10 @@ fn encode_png(width: u16, height: u16, bgra: &[u8]) -> ActResult<Vec<u8>> {
     }
     // Convert BGRA → RGB.
     let mut rgb = Vec::with_capacity(w * h * 3);
-    for px in bgra.chunks_exact(4) {
+    // `as_chunks` rather than `chunks_exact`: the length check above already
+    // proved the buffer divides evenly, and a const chunk size lets the
+    // indexing below be bounds-checked once instead of three times per pixel.
+    for px in bgra.as_chunks::<4>().0 {
         // Layout we requested: shift_r=16, shift_g=8, shift_b=0, little-endian
         // → byte order is [B, G, R, A].
         rgb.push(px[2]);
@@ -559,13 +703,13 @@ fn vnc_password_key(password: &str) -> [u8; 8] {
 
 fn des_encrypt_blocks(key: &[u8; 8], data: &[u8; 16]) -> [u8; 16] {
     use des::Des;
-    use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
-    let cipher = Des::new(GenericArray::from_slice(key));
-    let mut out = [0u8; 16];
-    for chunk in 0..2 {
-        let mut block = GenericArray::clone_from_slice(&data[chunk * 8..chunk * 8 + 8]);
+    use des::cipher::{Block, BlockCipherEncrypt, KeyInit};
+    let cipher = Des::new(&(*key).into());
+    let mut out = *data;
+    for chunk in out.as_chunks_mut::<8>().0 {
+        let mut block = Block::<Des>::from(*chunk);
         cipher.encrypt_block(&mut block);
-        out[chunk * 8..chunk * 8 + 8].copy_from_slice(&block);
+        chunk.copy_from_slice(&block);
     }
     out
 }
@@ -594,6 +738,97 @@ mod tests {
         assert_eq!(key[0], 0x86);
         assert_eq!(key[1], 0x46);
         assert_eq!(&key[2..], &[0; 6]);
+    }
+
+    /// Known-answer test (the classic FIPS 46 worked example), run on both
+    /// halves of the challenge so the block loop is covered too.
+    #[test]
+    fn des_encrypts_both_challenge_blocks() {
+        let key = [0x13, 0x34, 0x57, 0x79, 0x9B, 0xBC, 0xDF, 0xF1];
+        let pt = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+        let ct = [0x85, 0xE8, 0x13, 0x54, 0x0F, 0x0A, 0xB4, 0x05];
+        let mut data = [0u8; 16];
+        data[..8].copy_from_slice(&pt);
+        data[8..].copy_from_slice(&pt);
+        let out = des_encrypt_blocks(&key, &data);
+        assert_eq!(&out[..8], &ct);
+        assert_eq!(&out[8..], &ct);
+    }
+
+    /// The path that lets vnc-desktop drive an unauthenticated server with an
+    /// empty credential store — the reason the store is consulted lazily and
+    /// only on demand. `x11vnc -nopw` offers exactly `[1]`, and the e2e suite
+    /// runs against one.
+    #[test]
+    fn a_server_that_wants_no_password_needs_no_credential() {
+        assert_eq!(
+            plan_security(&[SEC_NONE], false).expect("None is answerable"),
+            SecurityPlan::NoAuth
+        );
+    }
+
+    /// The other half of the same rule: a missing credential is an error only
+    /// when the server actually demands the challenge.
+    #[test]
+    fn a_server_that_demands_the_challenge_needs_one() {
+        assert_eq!(
+            plan_security(&[SEC_VNC_AUTH], false).expect("answerable"),
+            SecurityPlan::CredentialRequired
+        );
+    }
+
+    /// A stored credential is used when the server will take it, even though
+    /// the connection could have gone through unauthenticated. This is what
+    /// the `password` session argument used to buy, kept.
+    #[test]
+    fn a_stored_credential_is_used_in_preference_to_connecting_anonymously() {
+        assert_eq!(
+            plan_security(&[SEC_NONE, SEC_VNC_AUTH], true).expect("answerable"),
+            SecurityPlan::VncAuth
+        );
+    }
+
+    /// Both offered and nothing stored: the server said unauthenticated is
+    /// acceptable, so the session opens rather than demanding provisioning.
+    #[test]
+    fn both_offered_and_nothing_stored_falls_back_to_the_anonymous_path() {
+        assert_eq!(
+            plan_security(&[SEC_NONE, SEC_VNC_AUTH], false).expect("answerable"),
+            SecurityPlan::NoAuth
+        );
+    }
+
+    /// A credential cannot rescue a server that never offers the challenge —
+    /// it must not be silently discarded into a `None` connection *only* when
+    /// `None` is genuinely on offer, and must be a plain failure otherwise.
+    #[test]
+    fn a_credential_does_not_make_an_unspeakable_security_type_speakable() {
+        // 18 = TLS-VNC, 19 = VeNCrypt: real types this client cannot answer.
+        let e = plan_security(&[18, 19], true).expect_err("nothing to answer with");
+        assert!(e.message.contains("neither None nor VNC Auth"), "{e:?}");
+        assert!(
+            plan_security(&[18, 19], false).is_err(),
+            "and it is no more answerable without one"
+        );
+        // Offered but unusable types alongside a usable one are ignored.
+        assert_eq!(
+            plan_security(&[18, SEC_NONE], false).expect("answerable"),
+            SecurityPlan::NoAuth
+        );
+    }
+
+    /// The refusal a rejected password produces is the kind the session's
+    /// poison flag keys off. Pinned here because the flag is only correct if
+    /// this kind is only ever produced by an authentication failure.
+    #[test]
+    fn a_rejected_password_is_reported_as_capability_denied() {
+        // Constructed rather than driven: reaching the real one needs a server
+        // that answers SecurityResult=1, which is an e2e concern. What matters
+        // here is that the constant lib.rs matches on is this one.
+        assert_eq!(
+            ActError::capability_denied("x").kind,
+            act_sdk::constants::ERR_CAPABILITY_DENIED
+        );
     }
 
     #[test]

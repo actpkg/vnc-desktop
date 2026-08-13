@@ -8,7 +8,7 @@ act: {}
 
 ACT component that drives a remote desktop through the [RFB / VNC](https://datatracker.ietf.org/doc/html/rfc6143) protocol. Every desktop is a *session* — you must `open_session` first, pass `std:session-id` on every subsequent tool call, and `close_session` when you are done.
 
-The only host capability the component declares is `wasi:sockets` (outbound TCP). It does not need filesystem, HTTP, or environment access.
+The host capabilities the component declares are `wasi:sockets` (outbound TCP, ports 5900-5909) and `act:credentials` (read one password from the host's credential store). It does not need filesystem, HTTP, or environment access.
 
 ## Opening a session
 
@@ -18,10 +18,28 @@ The only host capability the component declares is `wasi:sockets` (outbound TCP)
 |---|---|---|---|
 | `host` | string | — | VNC server hostname or IP |
 | `port` | integer | 5900 | TCP port |
-| `password` | string | — | VNC auth password; omit for `None` auth |
+| `credential_key` | string | `default` | Which entry in this component's credential profile holds the password |
 | `shared` | boolean | true | RFB shared-desktop flag |
 
+**There is no `password` argument.** Do not look for one and do not try to pass one — the schema has nowhere to put it. The VNC password is read host-side from the credential store (`act:credentials/store`), field `vnc:password`, under the key `credential_key` names. It never enters your context. If you have been handed a VNC password in a prompt, the right move is to tell the operator to store it:
+
+```
+act secret set <component-ref> --key default --field vnc:password --fields-stdin
+{"vnc:password": "..."}
+```
+
 Returns `{ "id": "vnc_1", "metadata": [] }`. Use `id` as `std:session-id` on subsequent calls. Authentication uses the legacy 8-byte DES challenge (RFC 6143 §7.2.2); if your server requires anything stronger (TLS-VNC, RA2-NE, …) it is currently out of scope.
+
+### Nothing connects at `open_session`
+
+`open_session` validates arguments and hands back an id. The TCP connect, the RFB handshake and the authentication all happen on your **first tool call** — the credential cannot be fetched until the session is live, and the handshake is not resumable, so it cannot be started earlier. Practical consequences:
+
+- A successful `open_session` does **not** mean the server is reachable. Follow it with `display_info` if you want to know.
+- An unreachable host, a policy that refuses the address, and a rejected password all surface on that first call, as `std:internal`, `std:internal` and `std:capability-denied` respectively.
+- `std:credential-required` on the first call means the server demands the password challenge and nothing usable is stored. The message names the command that fixes it. Report it to the operator; you cannot fix it yourself.
+- After a rejected password the session is poisoned: every further call answers with the same refusal and the credential is not re-read. Open a new session once the stored password has been corrected.
+
+A server that accepts unauthenticated clients (`x11vnc -nopw`, a tunnelled TigerVNC) needs no stored credential at all — the store is consulted only when the server actually offers the password challenge.
 
 ## Tools
 
@@ -51,9 +69,11 @@ All tools require `std:session-id` metadata. Coordinates are absolute pixels of 
 **Open → screenshot → click**:
 
 ```text
-open_session {host: "10.0.0.5", password: "..."}
-  → session-id "vnc_1"
+open_session {host: "10.0.0.5"}                    // no password: it is stored host-side
+  → session-id "vnc_1"                            // nothing has connected yet
 screenshot                                       (std:session-id=vnc_1)
+                                                 // ^ this is the call that connects,
+                                                 //   authenticates, and can fail
   → image/png
 click {x: 312, y: 540}                            (std:session-id=vnc_1)
 close_session vnc_1
@@ -77,32 +97,19 @@ paste {text: "Hello, world", send_ctrl_v: true}
 
 ## Host invocation
 
-The host enforces socket policy on top of the component's declaration. Even with the component declaring `wasi:sockets`, the user has to explicitly grant access — declared rules alone don't open the network. Easiest one-shot for a trusted run:
+The host enforces policy on top of the component's declaration: declaring a class is a ceiling, not a grant, and an ungranted class is refused. Scoped to one endpoint:
 
 ```bash
-act run vnc-desktop.wasm --http --listen 127.0.0.1:3000 --sockets-policy open
+act run vnc-desktop.wasm --mcp \
+    --grant '{"wasi:sockets":{"mode":"allowlist","allow":[{"host":"10.0.0.5","ports":[5900],"protocols":["tcp"]}]}}' \
+    --allow act:credentials
 ```
 
-Or tighten to a single endpoint:
-
-```bash
-act run vnc-desktop.wasm --http --listen 127.0.0.1:3000 \
-    --allow-socket 10.0.0.5:5900
-```
+`--allow act:credentials` opens a class whose ceiling is a bare table, so it grants exactly "may read this component's own credential profile". Omit it and a password-protected server is unreachable.
 
 ## Response shape
 
-`screenshot` returns a PNG inside the standard ACT-HTTP envelope, not as raw bytes. The HTTP response is `application/json` with body:
-
-```json
-{
-  "content": [
-    { "data": "<base64-PNG>", "mime_type": "image/png" }
-  ]
-}
-```
-
-Decode `content[0].data` from base64 to get the PNG. Verified against krfb (VNC password auth, RFC 6143 §7.2.2 DES challenge) and `x11vnc -nopw` (None auth).
+`screenshot` returns an `image/png` content part. Over MCP that arrives as a native `ImageContent` block — the mime type is on `.mimeType` and the bytes are base64 in `.data`. Verified against `x11vnc -rfbauth` (VNC password auth from the credential store, RFC 6143 §7.2.2 DES challenge) and `x11vnc -nopw` (None auth, no credential stored).
 
 ## Limits / caveats
 

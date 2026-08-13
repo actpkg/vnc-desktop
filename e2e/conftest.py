@@ -172,6 +172,16 @@ async def client(act_command: list[str], wasm_path: Path, vnc_server: tuple[str,
     allowlist scoped to exactly the VNC server's host and port, not the
     component's full declared ceiling (act.toml allows ports 5900-5909 on
     any host).
+
+    `--allow act:credentials` opens the credential store class, whose ceiling
+    is a bare table in act.toml, so this grants exactly that and nothing
+    wider. It is unconditional even though the server these tests drive
+    (`x11vnc -nopw`) offers security type `None` and therefore never causes a
+    `get-secret` — the class is checked when the component starts, not per
+    call, and running without it would leave the component unable to reach
+    the store on the day a test points it at a password-protected server.
+    No credential *store* is named here, so there is nothing to fetch: that
+    absence is the point in `test_credentials.py`.
     """
     host, port = vnc_server
     grant = json.dumps({
@@ -182,7 +192,8 @@ async def client(act_command: list[str], wasm_path: Path, vnc_server: tuple[str,
     })
     transport = StdioTransport(
         command=act_command[0],
-        args=[*act_command[1:], "run", str(wasm_path), "--mcp", "--grant", grant],
+        args=[*act_command[1:], "run", str(wasm_path), "--mcp",
+              "--grant", grant, "--allow", "act:credentials"],
         keep_alive=False,  # stateful component: fresh process per test is not optional here
         log_file=LOG_FILE,
     )
@@ -247,7 +258,9 @@ def expect_error():
     care.
     """
 
-    async def _expect(client, tool: str, arguments: dict, kind: str):
+    async def _expect(
+        client, tool: str, arguments: dict, kind: str, contains: str | None = None,
+    ):
         try:
             result = await client.call_tool(tool, arguments, raise_on_error=False)
         except McpError as exc:
@@ -255,6 +268,9 @@ def expect_error():
             assert data.get("dev.actcore/error-kind") == kind, (
                 f"expected {kind} on the JSON-RPC error path, got {data!r}"
             )
+            if contains is not None:
+                message = getattr(exc.error, "message", "") or ""
+                assert contains in message, f"expected {contains!r} in {message!r}"
             return
 
         assert result.is_error, f"expected {tool} to fail, got {result!r}"
@@ -262,6 +278,9 @@ def expect_error():
         assert meta.get("dev.actcore/error-kind") == kind, (
             f"expected {kind} on the isError path, got {meta!r}"
         )
+        if contains is not None:
+            message = result.content[0].text if result.content else ""
+            assert contains in message, f"expected {contains!r} in {message!r}"
 
     return _expect
 
