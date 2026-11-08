@@ -73,7 +73,7 @@ The whole connect — TCP, RFB handshake, authentication — therefore happens o
 
 ```bash
 just init        # fetch WIT deps with wkg (wit/deps/ is gitignored)
-just build       # cargo build --release for wasm32-wasip2, then pack
+just build       # cargo build --release for wasm32-wasip3, then pack
 just pack        # re-embed metadata + skill without rebuilding
 just test        # e2e: provisions Xvfb + x11vnc and drives `act run --mcp`
 ```

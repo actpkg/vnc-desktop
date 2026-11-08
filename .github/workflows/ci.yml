@@ -44,7 +44,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: component
-          path: target/wasm32-wasip2/release/component_vnc_desktop.wasm
+          path: target/wasm32-wasip3/release/component_vnc_desktop.wasm
 
   e2e:
     runs-on: ubuntu-latest
@@ -54,7 +54,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: component
-          path: target/wasm32-wasip2/release/
+          path: target/wasm32-wasip3/release/
       - uses: actions/setup-node@v5
         with:
           node-version: '22'
@@ -63,13 +63,12 @@ jobs:
           bins: just, wkg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: astral-sh/setup-uv@v6
       - run: just init
 
       - name: Install Xvfb + x11vnc
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends xvfb x11vnc xdotool
+          sudo apt-get install -y --no-install-recommends xvfb x11vnc xdotool x11-xserver-utils
 
       - name: Launch Xvfb + x11vnc on :99
         run: |
@@ -103,7 +102,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: component
-          path: target/wasm32-wasip2/release/
+          path: target/wasm32-wasip3/release/
       - uses: actions/setup-node@v5
         with:
           node-version: '22'

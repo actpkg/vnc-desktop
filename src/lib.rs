@@ -45,10 +45,12 @@ mod component {
     use serde::Serialize;
 
     // Session state lives in the SDK's SessionRegistry — a per-component
-    // session-id -> T map (the wasm runtime is single-threaded).
-    thread_local! {
-        static SESSIONS: SessionRegistry<SessionState> = SessionRegistry::new("vnc");
-    }
+    // session-id -> T map. A plain `static`, not `thread_local!`: under
+    // wasip3 every host fiber gets its own TLS, so a `thread_local` registry
+    // would be repopulated from scratch on every tool call and no session
+    // would survive between them. See the `act_sdk::sessions` module docs.
+    static SESSIONS: std::sync::LazyLock<SessionRegistry<SessionState>> =
+        std::sync::LazyLock::new(|| SessionRegistry::new("vnc"));
 
     /// The credential field this component reads.
     ///
@@ -132,13 +134,11 @@ mod component {
         F: FnOnce(&mut Connection) -> ActResult<T>,
     {
         SESSIONS
-            .with(|r| {
-                r.with_mut(id, |s| match s.conn.as_mut() {
-                    Some(c) => f(c),
-                    None => Err(ActError::internal(
-                        "internal: the session has no connection; ensure_connection was skipped",
-                    )),
-                })
+            .with_mut(id, |s| match s.conn.as_mut() {
+                Some(c) => f(c),
+                None => Err(ActError::internal(
+                    "internal: the session has no connection; ensure_connection was skipped",
+                )),
             })
             .ok_or_else(|| unknown_session(id))?
     }
@@ -213,20 +213,16 @@ mod component {
                  key in this component's credential profile, not a sentence."
             )));
         }
-        Ok(SESSIONS.with(|r| {
-            r.insert(SessionState {
-                cfg: args,
-                conn: None,
-                credential_rejected: false,
-            })
+        Ok(SESSIONS.insert(SessionState {
+            cfg: args,
+            conn: None,
+            credential_rejected: false,
         }))
     }
 
     #[session_close]
     fn close(session_id: String) {
-        SESSIONS.with(|r| {
-            r.remove(&session_id);
-        });
+        SESSIONS.remove(&session_id);
     }
 
     // ── Connecting, lazily ──────────────────────────────────────────────
@@ -259,7 +255,7 @@ mod component {
     /// can currently produce that race, both being request/response.
     pub async fn ensure_connection(session_id: &str) -> ActResult<()> {
         if SESSIONS
-            .with(|r| r.with(session_id, |s| s.conn.is_some()))
+            .with(session_id, |s| s.conn.is_some())
             .unwrap_or(false)
         {
             return Ok(());
@@ -270,7 +266,7 @@ mod component {
             return Err(e);
         }
         let cfg = SESSIONS
-            .with(|r| r.with(session_id, |s| s.cfg.clone()))
+            .with(session_id, |s| s.cfg.clone())
             .ok_or_else(|| unknown_session(session_id))?;
 
         let addr = format!("{}:{}", cfg.host, cfg.port);
@@ -304,13 +300,12 @@ mod component {
                 // failure never reaches this kind, and those are the ones that
                 // fix themselves.
                 if e.kind == ERR_CAPABILITY_DENIED {
-                    let _ =
-                        SESSIONS.with(|r| r.with_mut(session_id, |s| s.credential_rejected = true));
+                    let _ = SESSIONS.with_mut(session_id, |s| s.credential_rejected = true);
                 }
             })?;
 
         SESSIONS
-            .with(|r| r.with_mut(session_id, |s| s.conn = Some(conn)))
+            .with_mut(session_id, |s| s.conn = Some(conn))
             .ok_or_else(|| unknown_session(session_id))
     }
 
@@ -323,7 +318,7 @@ mod component {
     /// no host implementation here.
     fn poisoned(session_id: &str) -> Option<ActError> {
         SESSIONS
-            .with(|r| r.with(session_id, |s| s.credential_rejected))
+            .with(session_id, |s| s.credential_rejected)
             .unwrap_or(false)
             .then(|| ActError::new(ERR_CAPABILITY_DENIED, CREDENTIAL_REJECTED))
     }
@@ -937,9 +932,7 @@ mod component {
             let id = open(args("127.0.0.1")).expect("opens");
             assert!(id.starts_with("vnc_"), "got {id}");
             assert!(
-                SESSIONS
-                    .with(|r| r.with(&id, |s| s.conn.is_none()))
-                    .unwrap(),
+                SESSIONS.with(&id, |s| s.conn.is_none()).unwrap(),
                 "open must not have connected"
             );
         }
@@ -953,7 +946,7 @@ mod component {
         fn a_poisoned_session_refuses_without_touching_the_store() {
             let id = open(args("127.0.0.1")).expect("opens");
             assert!(poisoned(&id).is_none(), "a fresh session is not poisoned");
-            SESSIONS.with(|r| r.with_mut(&id, |s| s.credential_rejected = true));
+            SESSIONS.with_mut(&id, |s| s.credential_rejected = true);
 
             let e = poisoned(&id).expect("poisoned");
             assert_eq!(e.kind, ERR_CAPABILITY_DENIED);

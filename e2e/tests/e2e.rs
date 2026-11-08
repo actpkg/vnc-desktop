@@ -21,7 +21,7 @@ use std::time::Duration;
 use rmcp::{
     ServiceExt,
     model::CallToolRequestParams,
-    transport::{TokioChildProcess, ConfigureCommandExt},
+    transport::{ConfigureCommandExt, TokioChildProcess},
 };
 use serde_json::{Value, json};
 
@@ -45,7 +45,7 @@ fn wasm_path() -> PathBuf {
     PathBuf::from(std::env::var("WASM").unwrap_or_else(|_| {
         concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../target/wasm32-wasip2/release/component_vnc_desktop.wasm"
+            "/../target/wasm32-wasip3/release/component_vnc_desktop.wasm"
         )
         .into()
     }))
@@ -85,13 +85,41 @@ fn wait_for_port(host: &str, port: u16) {
     panic!("{host}:{port} never accepted a connection");
 }
 
+/// One provisioned VNC endpoint. `Xvfb(None)` = external server (CI's
+/// `VNC_HOST`/`VNC_PORT` env path): nothing owned, Drop must not pkill
+/// a server it did not start.
+struct Xvfb(Option<Child>);
+
+fn vnc_endpoint() -> (&'static str, u16) {
+    // CI exports VNC_HOST/VNC_PORT after launching its own Xvfb :99 +
+    // x11vnc :5900 (ci.yml "Launch Xvfb + x11vnc on :99"); set env means
+    // "use that server", unset means "start our own pair". Mirrors python
+    // conftest's two provisioning paths.
+    static EP: std::sync::OnceLock<(&'static str, u16)> = std::sync::OnceLock::new();
+    *EP.get_or_init(|| {
+        // Leak the value: `static`-bound endpoint, read once per process.
+        let host: &'static str = match std::env::var("VNC_HOST") {
+            Ok(h) => Box::leak(h.into_boxed_str()),
+            Err(_) => SELF_PROVISIONED_HOST,
+        };
+        let port = std::env::var("VNC_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(SELF_PROVISIONED_PORT);
+        (host, port)
+    })
+}
+
 /// Provision one Xvfb + x11vnc pair. `password`: `None` is `-nopw`
 /// (unauthenticated); `Some(passfile)` is `-rfbauth` (VNC Auth challenge).
 /// Returns the xvfb child (to terminate in the caller) — x11vnc daemonizes
 /// with `-bg` and is killed by its command line instead.
-struct Xvfb(Child);
-
-fn provision_vnc(display: &str, screen: &str, listen: (&str, u16), password: Option<&PathBuf>) -> Xvfb {
+fn provision_vnc(
+    display: &str,
+    screen: &str,
+    listen: (&str, u16),
+    password: Option<&PathBuf>,
+) -> Xvfb {
     // x11vnc autodetects Wayland ahead of the X11 DISPLAY it is told to use
     // when WAYLAND_DISPLAY/XDG_SESSION_TYPE are set — strip both so it
     // actually targets the Xvfb display started here.
@@ -118,7 +146,10 @@ fn provision_vnc(display: &str, screen: &str, listen: (&str, u16), password: Opt
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    assert!(ready, "Xvfb {display} never became ready (xdpyinfo kept failing)");
+    assert!(
+        ready,
+        "Xvfb {display} never became ready (xdpyinfo kept failing)"
+    );
 
     let mut cmd = Command::new("x11vnc");
     cmd.args(["-display", display]);
@@ -131,30 +162,101 @@ fn provision_vnc(display: &str, screen: &str, listen: (&str, u16), password: Opt
             cmd.arg("-nopw");
         }
     }
-    cmd.args(["-localhost", "-listen", listen.0, "-forever", "-shared", "-bg"]);
+    cmd.args([
+        "-localhost",
+        "-listen",
+        listen.0,
+        "-forever",
+        "-shared",
+        "-bg",
+    ]);
+    // `Command::env` only adds/overrides: replaying the filtered vars would
+    // still leave the inherited WAYLAND_DISPLAY/XDG_SESSION_TYPE in place,
+    // and x11vnc then autodetects the compositor session and exits instead
+    // of serving the Xvfb display it was pointed at. Remove them outright.
+    cmd.env_remove("WAYLAND_DISPLAY");
+    cmd.env_remove("XDG_SESSION_TYPE");
     for (k, v) in &wayland_free {
         cmd.env(k, v);
     }
     cmd.env("DISPLAY", display);
     let out = cmd.output().expect("run x11vnc");
-    assert!(out.status.success(), "x11vnc failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "x11vnc failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     wait_for_port(listen.0, listen.1);
-    Xvfb(xvfb)
+    Xvfb(Some(xvfb))
 }
 
 impl Drop for Xvfb {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        // External server (the env path): never owned, never killed.
+        let Some(child) = self.0.as_mut() else {
+            return;
+        };
+        let _ = child.kill();
+        let _ = child.wait();
         // x11vnc daemonized (-bg): not a child of this process, so kill it
         // by the command line that started it.
-        let _ = Command::new("pkill").arg("-f").arg("x11vnc -display").output();
+        let _ = Command::new("pkill")
+            .arg("-f")
+            .arg("x11vnc -display")
+            .output();
     }
 }
 
-/// The `vnc_server` fixture's self-provisioning path: :99 / 5900, nopw.
-fn self_provisioned_vnc() -> Xvfb {
-    provision_vnc(DISPLAY_NUM, "1024x768x24", (SELF_PROVISIONED_HOST, SELF_PROVISIONED_PORT), None)
+/// The nopw endpoint the nopw tests talk to: the `VNC_HOST`/`VNC_PORT`
+/// server when set (CI pre-launches :99/5900 — connect to it, NOT
+/// provision a second pair, which would collide), else self-provisioned
+/// :99/5900.
+///
+/// Shared across tests on a `OnceLock`: libtest runs tests on parallel
+/// threads and both paths bind FIXED endpoints (:99/5900, :98/5901) — two
+/// tests provisioning the same pair concurrently would race on the port
+/// (x11vnc: "could not obtain listening port"). One provisioning, created
+/// lazily on first use, never torn down: the process exits right after the
+/// last test anyway. This mirrors the python conftest's `scope="session"`
+/// `vnc_server` fixture.
+fn shared_nopw_vnc() -> &'static Xvfb {
+    static NOPW: std::sync::OnceLock<Xvfb> = std::sync::OnceLock::new();
+    NOPW.get_or_init(|| {
+        let (host, port) = vnc_endpoint();
+        if std::env::var_os("VNC_HOST").is_some() || std::env::var_os("VNC_PORT").is_some() {
+            // The CI path: the server is already up; just wait for its port.
+            wait_for_port(host, port);
+            return Xvfb(None);
+        }
+        provision_vnc(DISPLAY_NUM, "1024x768x24", (host, port), None)
+    })
+}
+
+/// The auth server: :98 / 5901, `-rfbauth` with [`PASSWORD`]. Same sharing
+/// rationale as [`shared_nopw_vnc`]; the passfile lives in a leaked tempdir
+/// (`std::mem::forget`) so the daemonized x11vnc keeps reading it for the
+/// whole process lifetime.
+fn shared_auth_vnc() -> &'static Xvfb {
+    static AUTH: std::sync::OnceLock<Xvfb> = std::sync::OnceLock::new();
+    AUTH.get_or_init(|| {
+        let passdir = tempfile::tempdir().unwrap();
+        let passfile = passdir.path().join("vncpass");
+        let out = Command::new("x11vnc")
+            .args(["-storepasswd", PASSWORD, passfile.to_str().unwrap()])
+            .output()
+            .expect("run x11vnc -storepasswd");
+        assert!(out.status.success(), "x11vnc -storepasswd failed");
+        // The passfile must outlive this closure: the daemonized x11vnc
+        // re-reads it on every VNC auth challenge, so leak the tempdir
+        // instead of letting it delete the file when the guard drops.
+        std::mem::forget(passdir);
+        provision_vnc(
+            AUTH_DISPLAY,
+            "800x600x24",
+            (AUTH_HOST, AUTH_PORT),
+            Some(&passfile),
+        )
+    })
 }
 
 fn spawn_transport(args: &[String]) -> TokioChildProcess {
@@ -212,12 +314,14 @@ fn arg_meta(session: &str) -> serde_json::Map<String, Value> {
 
 async fn open_session(client: &Client, host: &str, port: u16) -> String {
     let opened = client
-        .call_tool(CallToolRequestParams::new("open_session".to_string()).with_arguments(
-            json!({"host": host, "port": port})
-                .as_object()
-                .unwrap()
-                .clone(),
-        ))
+        .call_tool(
+            CallToolRequestParams::new("open_session".to_string()).with_arguments(
+                json!({"host": host, "port": port})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
         .await
         .expect("open_session");
     serde_json::from_str::<Value>(&first_text(&opened)).expect("reply is JSON")["id"]
@@ -244,9 +348,17 @@ async fn expect_error(
                 .as_ref()
                 .and_then(|d| d.get("dev.actcore/error-kind"))
                 .and_then(|v| v.as_str());
-            assert_eq!(got, Some(kind), "expected {kind} on the JSON-RPC error path");
+            assert_eq!(
+                got,
+                Some(kind),
+                "expected {kind} on the JSON-RPC error path"
+            );
             if let Some(contains) = contains {
-                assert!(e.message.contains(contains), "expected {contains:?} in {:?}", e.message);
+                assert!(
+                    e.message.contains(contains),
+                    "expected {contains:?} in {:?}",
+                    e.message
+                );
             }
         }
         Ok(result) => {
@@ -276,7 +388,11 @@ async fn expect_error(
 #[test]
 fn manifest_reports_name_and_version() {
     let out = run_act(
-        &["inspect", "component-manifest", wasm_path().to_str().unwrap()],
+        &[
+            "inspect",
+            "component-manifest",
+            wasm_path().to_str().unwrap(),
+        ],
         None,
     );
     assert!(out.status.success(), "inspect failed");
@@ -290,7 +406,11 @@ fn manifest_name_and_sockets_capability() {
     // session.hurl's own step 1 — sockets-only capabilities, before any
     // session is opened.
     let out = run_act(
-        &["inspect", "component-manifest", wasm_path().to_str().unwrap()],
+        &[
+            "inspect",
+            "component-manifest",
+            wasm_path().to_str().unwrap(),
+        ],
         None,
     );
     let manifest: Value = serde_json::from_slice(&out.stdout).expect("manifest is JSON");
@@ -299,12 +419,13 @@ fn manifest_name_and_sockets_capability() {
 
 #[tokio::test]
 async fn component_exposes_its_tools() {
-    let xvfb = self_provisioned_vnc();
-    let client = connect((SELF_PROVISIONED_HOST, SELF_PROVISIONED_PORT), &[]).await;
+    let _xvfb = shared_nopw_vnc();
+    let client = connect(vnc_endpoint(), &[]).await;
     let tools = client.list_all_tools().await.expect("list_all_tools");
     assert!(tools.len() >= 1);
     client.cancel().await.ok();
-    drop(xvfb);
+    // The shared server is never dropped: other tests reuse it, and the
+    // process exit cleans up whatever is left.
 }
 
 // ---------------------------------------------------------------------------
@@ -313,9 +434,10 @@ async fn component_exposes_its_tools() {
 
 #[tokio::test]
 async fn session_lifecycle() {
-    let xvfb = self_provisioned_vnc();
-    let client = connect((SELF_PROVISIONED_HOST, SELF_PROVISIONED_PORT), &[]).await;
-    let sid = open_session(&client, SELF_PROVISIONED_HOST, SELF_PROVISIONED_PORT).await;
+    let _xvfb = shared_nopw_vnc();
+    let client = connect(vnc_endpoint(), &[]).await;
+    let (host, port) = vnc_endpoint();
+    let sid = open_session(&client, host, port).await;
     let meta = arg_meta(&sid);
 
     // Display info — confirms the RFB handshake completed.
@@ -386,14 +508,14 @@ async fn session_lifecycle() {
     // here.
     client
         .call_tool(
-            CallToolRequestParams::new("close_session".to_string()).with_arguments(
-                json!({"session_id": sid}).as_object().unwrap().clone(),
-            ),
+            CallToolRequestParams::new("close_session".to_string())
+                .with_arguments(json!({"session_id": sid}).as_object().unwrap().clone()),
         )
         .await
         .expect("close_session");
     client.cancel().await.ok();
-    drop(xvfb);
+    // The shared server is never dropped: other tests reuse it, and the
+    // process exit cleans up whatever is left.
 }
 
 // ---------------------------------------------------------------------------
@@ -408,8 +530,8 @@ const PASSWORD: &str = "s3cr3t-vnc";
 
 #[tokio::test]
 async fn open_session_offers_nowhere_to_put_a_password() {
-    let xvfb = self_provisioned_vnc();
-    let client = connect((SELF_PROVISIONED_HOST, SELF_PROVISIONED_PORT), &[]).await;
+    let _xvfb = shared_nopw_vnc();
+    let client = connect(vnc_endpoint(), &[]).await;
     let tools = client.list_all_tools().await.expect("list_all_tools");
     let open = tools
         .iter()
@@ -423,7 +545,9 @@ async fn open_session_offers_nowhere_to_put_a_password() {
         .unwrap_or_default();
     for name in props.keys() {
         let lowered = name.to_lowercase();
-        for word in ["password", "passwd", "pwd", "secret", "token", "auth", "api_key"] {
+        for word in [
+            "password", "passwd", "pwd", "secret", "token", "auth", "api_key",
+        ] {
             assert!(
                 !lowered.contains(word),
                 "{name} must never be a session argument"
@@ -436,7 +560,8 @@ async fn open_session_offers_nowhere_to_put_a_password() {
         props.keys().collect::<Vec<_>>()
     );
     client.cancel().await.ok();
-    drop(xvfb);
+    // The shared server is never dropped: other tests reuse it, and the
+    // process exit cleans up whatever is left.
 }
 
 #[tokio::test]
@@ -444,13 +569,13 @@ async fn an_unauthenticated_server_needs_no_credential_store() {
     // The client names no --credentials-backend at all. Against
     // `x11vnc -nopw` that is not a problem: security type None, so the
     // component never asks.
-    let xvfb = self_provisioned_vnc();
-    let client = connect((SELF_PROVISIONED_HOST, SELF_PROVISIONED_PORT), &[]).await;
-    let sid = open_session(&client, SELF_PROVISIONED_HOST, SELF_PROVISIONED_PORT).await;
+    let _xvfb = shared_nopw_vnc();
+    let client = connect(vnc_endpoint(), &[]).await;
+    let (host, port) = vnc_endpoint();
+    let sid = open_session(&client, host, port).await;
     let di = client
         .call_tool(
-            CallToolRequestParams::new("display_info".to_string())
-                .with_arguments(arg_meta(&sid)),
+            CallToolRequestParams::new("display_info".to_string()).with_arguments(arg_meta(&sid)),
         )
         .await
         .expect("display_info");
@@ -462,7 +587,8 @@ async fn an_unauthenticated_server_needs_no_credential_store() {
             >= 100
     );
     client.cancel().await.ok();
-    drop(xvfb);
+    // The shared server is never dropped: other tests reuse it, and the
+    // process exit cleans up whatever is left.
 }
 
 /// A store holding the VNC password under the key the component looks for
@@ -509,19 +635,7 @@ async fn a_password_protected_server_fails_on_the_first_call_not_at_open() {
     // Nothing connects at open, so open_session succeeds even though the
     // session can never be used — the failure moved to the first tool call,
     // and the message has to say how to fix it.
-    let passfile = tempfile::tempdir().unwrap();
-    let passfile = passfile.path().join("vncpass");
-    let out = Command::new("x11vnc")
-        .args(["-storepasswd", PASSWORD, passfile.to_str().unwrap()])
-        .output()
-        .expect("run x11vnc -storepasswd");
-    assert!(out.status.success(), "x11vnc -storepasswd failed");
-    let xvfb = provision_vnc(
-        AUTH_DISPLAY,
-        "800x600x24",
-        (AUTH_HOST, AUTH_PORT),
-        Some(&passfile),
-    );
+    let _xvfb = shared_auth_vnc();
 
     // The same host with the class granted but NO store named — the shape of
     // a deployment where nobody ran `act secret set`.
@@ -538,24 +652,13 @@ async fn a_password_protected_server_fails_on_the_first_call_not_at_open() {
     )
     .await;
     client.cancel().await.ok();
-    drop(xvfb);
+    // The shared server is never dropped: other tests reuse it, and the
+    // process exit cleans up whatever is left.
 }
 
 #[tokio::test]
 async fn a_stored_credential_authenticates_the_session() {
-    let passfile = tempfile::tempdir().unwrap();
-    let passfile = passfile.path().join("vncpass");
-    let out = Command::new("x11vnc")
-        .args(["-storepasswd", PASSWORD, passfile.to_str().unwrap()])
-        .output()
-        .expect("run x11vnc -storepasswd");
-    assert!(out.status.success());
-    let xvfb = provision_vnc(
-        AUTH_DISPLAY,
-        "800x600x24",
-        (AUTH_HOST, AUTH_PORT),
-        Some(&passfile),
-    );
+    let _xvfb = shared_auth_vnc();
     let backend = credential_store(PASSWORD);
     let client = connect(
         (AUTH_HOST, AUTH_PORT),
@@ -566,8 +669,7 @@ async fn a_stored_credential_authenticates_the_session() {
     let sid = open_session(&client, AUTH_HOST, AUTH_PORT).await;
     let di = client
         .call_tool(
-            CallToolRequestParams::new("display_info".to_string())
-                .with_arguments(arg_meta(&sid)),
+            CallToolRequestParams::new("display_info".to_string()).with_arguments(arg_meta(&sid)),
         )
         .await
         .expect("display_info");
@@ -585,8 +687,7 @@ async fn a_stored_credential_authenticates_the_session() {
     // re-fetch the credential, and must still work.
     let sc = client
         .call_tool(
-            CallToolRequestParams::new("screenshot".to_string())
-                .with_arguments(arg_meta(&sid)),
+            CallToolRequestParams::new("screenshot".to_string()).with_arguments(arg_meta(&sid)),
         )
         .await
         .expect("screenshot");
@@ -597,33 +698,21 @@ async fn a_stored_credential_authenticates_the_session() {
 
     client
         .call_tool(
-            CallToolRequestParams::new("close_session".to_string()).with_arguments(
-                json!({"session_id": sid}).as_object().unwrap().clone(),
-            ),
+            CallToolRequestParams::new("close_session".to_string())
+                .with_arguments(json!({"session_id": sid}).as_object().unwrap().clone()),
         )
         .await
         .expect("close_session");
     client.cancel().await.ok();
-    drop(xvfb);
+    // The shared server is never dropped: other tests reuse it, and the
+    // process exit cleans up whatever is left.
 }
 
 #[tokio::test]
 async fn a_wrong_password_is_reported_once_and_not_re_fetched() {
     // A rejected password poisons the session: the second call answers from
     // the flag rather than going back to the store.
-    let passfile = tempfile::tempdir().unwrap();
-    let passfile = passfile.path().join("vncpass");
-    let out = Command::new("x11vnc")
-        .args(["-storepasswd", PASSWORD, passfile.to_str().unwrap()])
-        .output()
-        .expect("run x11vnc -storepasswd");
-    assert!(out.status.success());
-    let xvfb = provision_vnc(
-        AUTH_DISPLAY,
-        "800x600x24",
-        (AUTH_HOST, AUTH_PORT),
-        Some(&passfile),
-    );
+    let _xvfb = shared_auth_vnc();
     let backend = credential_store("not-the-password");
     let client = connect(
         (AUTH_HOST, AUTH_PORT),
@@ -652,5 +741,6 @@ async fn a_wrong_password_is_reported_once_and_not_re_fetched() {
     )
     .await;
     client.cancel().await.ok();
-    drop(xvfb);
+    // The shared server is never dropped: other tests reuse it, and the
+    // process exit cleans up whatever is left.
 }

@@ -1,5 +1,5 @@
 # This crate is host-only test code. The component root's .cargo/config.toml
-# defaults every build in this tree to wasm32-wasip2, so pin the host target
+# defaults every build in this tree to wasm32-wasip3, so pin the host target
 # here — a nearer config file wins — and a bare `cargo test` in e2e/ does the
 # right thing.
 [build]

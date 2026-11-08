@@ -1,4 +1,4 @@
-wasm := "target/wasm32-wasip2/release/component_vnc_desktop.wasm"
+wasm := "target/wasm32-wasip3/release/component_vnc_desktop.wasm"
 # OCI reference to publish to (registry/namespace/name, no tag). Override with OCI_REF.
 component_ref := env("OCI_REF", "actpkg.dev/library/vnc-desktop")
 
@@ -29,7 +29,7 @@ pack:
 # Rust e2e harness (rmcp client) — replaced the python fastmcp/pytest suite.
 # Must run from inside e2e/: cargo discovers .cargo/config.toml from the CWD,
 # and only e2e/'s own config pins the host target (the component root's pins
-# wasm32-wasip2). Needs Xvfb + x11vnc on PATH (or VNC_HOST/VNC_PORT set).
+# wasm32-wasip3). Needs Xvfb + x11vnc on PATH (or VNC_HOST/VNC_PORT set).
 test: build
     cd e2e && ACT="{{act}}" WASM="../{{wasm}}" cargo test
 
