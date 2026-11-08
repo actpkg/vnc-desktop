@@ -120,27 +120,20 @@ fn provision_vnc(
     listen: (&str, u16),
     password: Option<&PathBuf>,
 ) -> Xvfb {
-    // x11vnc autodetects Wayland ahead of the X11 DISPLAY it is told to use
-    // when WAYLAND_DISPLAY/XDG_SESSION_TYPE are set — strip both so it
-    // actually targets the Xvfb display started here.
-    let wayland_free: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| k != "WAYLAND_DISPLAY" && k != "XDG_SESSION_TYPE")
-        .collect();
-
     let xvfb = Command::new("Xvfb")
         .arg(display)
         .args(["-screen", "0", screen, "-nolisten", "tcp"])
         .spawn()
         .expect("spawn Xvfb (is it installed? apt install xvfb x11vnc)");
 
+    // Readiness probe: Xvfb's unix socket appearing under /tmp/.X11-unix.
+    // No xdpyinfo here — x11-utils is one more apt package whose absence
+    // once cost a CI round, and a listening socket is exactly the event
+    // x11vnc (and the component) actually need.
+    let sock = format!("/tmp/.X11-unix/X{}", display.trim_start_matches(':'));
     let mut ready = false;
     for _ in 0..40 {
-        let mut env_ok = Command::new("xdpyinfo");
-        for (k, v) in &wayland_free {
-            env_ok.env(k, v);
-        }
-        env_ok.env("DISPLAY", display);
-        if env_ok.output().expect("run xdpyinfo").status.success() {
+        if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
             ready = true;
             break;
         }
@@ -148,7 +141,7 @@ fn provision_vnc(
     }
     assert!(
         ready,
-        "Xvfb {display} never became ready (xdpyinfo kept failing)"
+        "Xvfb {display} never became ready ({sock} never accepted a connection)"
     );
 
     let mut cmd = Command::new("x11vnc");
@@ -176,9 +169,6 @@ fn provision_vnc(
     // of serving the Xvfb display it was pointed at. Remove them outright.
     cmd.env_remove("WAYLAND_DISPLAY");
     cmd.env_remove("XDG_SESSION_TYPE");
-    for (k, v) in &wayland_free {
-        cmd.env(k, v);
-    }
     cmd.env("DISPLAY", display);
     let out = cmd.output().expect("run x11vnc");
     assert!(

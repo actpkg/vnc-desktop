@@ -68,7 +68,12 @@ jobs:
       - name: Install Xvfb + x11vnc
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends xvfb x11vnc xdotool x11-xserver-utils
+          sudo apt-get install -y --no-install-recommends xvfb x11vnc xdotool
+
+      - name: Install act CLI (one download; npx-per-invocation races under test parallelism)
+        run: |
+          npm install -g @actcore/act
+          echo "ACT=act" >> "$GITHUB_ENV"
 
       - name: Launch Xvfb + x11vnc on :99
         run: |
